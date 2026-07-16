@@ -29,7 +29,15 @@ impl Database {
         let conn = self.0.lock().map_err(|_| "Database lock failed")?;
         conn.query_row("SELECT id,name,host,port,username,auth_kind,private_key_path,has_saved_password,has_saved_passphrase,theme_id,created_at,updated_at,last_connected_at FROM profiles WHERE id=?",[id],row_profile).optional().map_err(|e|e.to_string())
     }
-    pub fn save_profile(&self, d: &MachineDraft) -> Result<MachineProfile, String> {
+    /// The saved-secret flags come from the caller, which knows whether the
+    /// credential vault actually holds a value — the draft's checkboxes alone
+    /// do not (a checked box with no secret entered stores nothing).
+    pub fn save_profile(
+        &self,
+        d: &MachineDraft,
+        has_saved_password: bool,
+        has_saved_passphrase: bool,
+    ) -> Result<MachineProfile, String> {
         let id =
             d.id.clone()
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -45,7 +53,7 @@ impl Database {
             "privateKey"
         };
         let conn = self.0.lock().map_err(|_| "Database lock failed")?;
-        conn.execute("INSERT INTO profiles(id,name,host,port,username,auth_kind,private_key_path,has_saved_password,has_saved_passphrase,theme_id,created_at,updated_at,last_connected_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,host=excluded.host,port=excluded.port,username=excluded.username,auth_kind=excluded.auth_kind,private_key_path=excluded.private_key_path,has_saved_password=excluded.has_saved_password,has_saved_passphrase=excluded.has_saved_passphrase,theme_id=excluded.theme_id,updated_at=excluded.updated_at",params![id,d.name.trim(),d.host.trim(),d.port,d.username.trim(),auth,d.private_key_path,d.save_password,d.save_passphrase,d.theme_id,created,now,old.as_ref().and_then(|x|x.last_connected_at.clone())]).map_err(|e|e.to_string())?;
+        conn.execute("INSERT INTO profiles(id,name,host,port,username,auth_kind,private_key_path,has_saved_password,has_saved_passphrase,theme_id,created_at,updated_at,last_connected_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,host=excluded.host,port=excluded.port,username=excluded.username,auth_kind=excluded.auth_kind,private_key_path=excluded.private_key_path,has_saved_password=excluded.has_saved_password,has_saved_passphrase=excluded.has_saved_passphrase,theme_id=excluded.theme_id,updated_at=excluded.updated_at",params![id,d.name.trim(),d.host.trim(),d.port,d.username.trim(),auth,d.private_key_path,has_saved_password,has_saved_passphrase,d.theme_id,created,now,old.as_ref().and_then(|x|x.last_connected_at.clone())]).map_err(|e|e.to_string())?;
         drop(conn);
         self.profile(&id)?
             .ok_or_else(|| "Saved profile could not be loaded".into())
@@ -145,9 +153,41 @@ fn row_profile(r: &rusqlite::Row) -> rusqlite::Result<MachineProfile> {
 #[cfg(test)]
 mod tests {
     use super::Database;
-    use crate::models::AppSettings;
+    use crate::models::{AppSettings, AuthKind, MachineDraft};
     use rusqlite::Connection;
     use std::sync::Mutex;
+
+    fn profiles_database() -> Database {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch("CREATE TABLE profiles(id TEXT PRIMARY KEY,name TEXT NOT NULL,host TEXT NOT NULL,port INTEGER NOT NULL,username TEXT NOT NULL,auth_kind TEXT NOT NULL,private_key_path TEXT,has_saved_password INTEGER NOT NULL DEFAULT 0,has_saved_passphrase INTEGER NOT NULL DEFAULT 0,theme_id TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,last_connected_at TEXT);").unwrap();
+        Database(Mutex::new(connection))
+    }
+
+    #[test]
+    fn saved_secret_flags_come_from_the_caller_not_the_draft() {
+        let database = profiles_database();
+        let draft = MachineDraft {
+            id: None,
+            name: "box".into(),
+            host: "example.com".into(),
+            port: 22,
+            username: "root".into(),
+            auth_kind: AuthKind::Password,
+            private_key_path: None,
+            password: None,
+            passphrase: None,
+            save_password: true,
+            save_passphrase: true,
+            theme_id: None,
+        };
+        let profile = database.save_profile(&draft, false, false).unwrap();
+        assert!(!profile.has_saved_password);
+        assert!(!profile.has_saved_passphrase);
+
+        let stored = database.save_profile(&draft, true, false).unwrap();
+        assert!(stored.has_saved_password);
+        assert!(!stored.has_saved_passphrase);
+    }
 
     #[test]
     fn application_settings_round_trip() {

@@ -137,4 +137,5 @@ pub struct HostKeyChallenge {
     pub algorithm: String,
     pub fingerprint: String,
     pub kind: String,
+    pub window_label: String,
 }

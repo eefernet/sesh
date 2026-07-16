@@ -56,12 +56,23 @@ pub async fn start(sessions: Arc<SessionManager>) -> Result<TerminalTransportInf
         .collect::<String>();
     let server_token = token.clone();
     tauri::async_runtime::spawn(async move {
-        while let Ok((stream, _)) = listener.accept().await {
-            let sessions = sessions.clone();
-            let token = server_token.clone();
-            tauri::async_runtime::spawn(async move {
-                let _ = serve(stream, sessions, token).await;
-            });
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    let sessions = sessions.clone();
+                    let token = server_token.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let _ = serve(stream, sessions, token).await;
+                    });
+                }
+                Err(error) => {
+                    // Transient accept failures (e.g. EMFILE) must not kill
+                    // the loop — that would break every future terminal for
+                    // the rest of the app's lifetime. Back off briefly.
+                    eprintln!("[transport] accept failed: {error}");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
         }
     });
     Ok(TerminalTransportInfo {
@@ -110,7 +121,13 @@ async fn serve(
                     socket.send(Message::Binary(encode_output(event).into())).await.map_err(|e| e.to_string())?;
                     trace_latency("ws-out", bytes);
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                // Dropped frames corrupt the rendered terminal; make it
+                // visible instead of silent. A future protocol version could
+                // notify the client with a reserved all-zero-UUID frame.
+                Err(broadcast::error::RecvError::Lagged(missed)) => {
+                    eprintln!("[transport] client lagged; {missed} output frames dropped");
+                    continue;
+                }
                 Err(broadcast::error::RecvError::Closed) => break,
             }
         }

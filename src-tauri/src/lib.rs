@@ -9,8 +9,8 @@ use ssh::SessionManager;
 use std::{path::PathBuf, sync::Arc};
 use tauri::{Manager, State};
 
-struct AppState {
-    db: Database,
+pub(crate) struct AppState {
+    pub(crate) db: Database,
     sessions: Arc<SessionManager>,
     known_hosts: PathBuf,
     terminal_transport: terminal_transport::TerminalTransportInfo,
@@ -42,14 +42,37 @@ pub fn prepare_runtime() {
 }
 
 #[cfg(target_os = "linux")]
+fn is_wayland_session(
+    session_type: Option<&std::ffi::OsStr>,
+    wayland_display: Option<&std::ffi::OsStr>,
+) -> bool {
+    session_type.is_some_and(|value| value.eq_ignore_ascii_case("wayland"))
+        || wayland_display.is_some_and(|value| !value.is_empty())
+}
+
+#[cfg(target_os = "linux")]
 fn should_disable_dmabuf(
     session_type: Option<&std::ffi::OsStr>,
     wayland_display: Option<&std::ffi::OsStr>,
     user_override: Option<&std::ffi::OsStr>,
 ) -> bool {
-    let is_wayland = session_type.is_some_and(|value| value.eq_ignore_ascii_case("wayland"))
-        || wayland_display.is_some_and(|value| !value.is_empty());
-    is_wayland && user_override.is_none()
+    is_wayland_session(session_type, wayland_display) && user_override.is_none()
+}
+
+/// Whether the platform reports real global window positions. Wayland does
+/// not: window.screenX/screenY in the webview are frame-offset garbage and
+/// drag coordinates are window-relative, so the frontend must not use them.
+#[tauri::command]
+fn window_positioning_reliable() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        !is_wayland_session(
+            std::env::var_os("XDG_SESSION_TYPE").as_deref(),
+            std::env::var_os("WAYLAND_DISPLAY").as_deref(),
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    true
 }
 
 #[tauri::command]
@@ -63,23 +86,37 @@ fn save_profile(state: State<AppState>, draft: MachineDraft) -> Result<MachinePr
         .id
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    if draft.save_password {
-        if let Some(value) = draft.password.as_deref() {
-            secrets::set(&id, "password", value)?
-        }
-    } else {
-        secrets::delete(&id, "password")
-    }
-    if draft.save_passphrase {
-        if let Some(value) = draft.passphrase.as_deref() {
-            secrets::set(&id, "passphrase", value)?
-        }
-    } else {
-        secrets::delete(&id, "passphrase")
-    }
+    let has_saved_password =
+        store_secret(&id, "password", draft.save_password, draft.password.as_deref())?;
+    let has_saved_passphrase = store_secret(
+        &id,
+        "passphrase",
+        draft.save_passphrase,
+        draft.passphrase.as_deref(),
+    )?;
     let mut draft = draft;
     draft.id = Some(id);
-    state.db.save_profile(&draft)
+    state
+        .db
+        .save_profile(&draft, has_saved_password, has_saved_passphrase)
+}
+
+/// Store or clear one secret and report whether the vault actually holds a
+/// value afterwards — the profile's has_saved_* flag must reflect the vault,
+/// not the checkbox (saving with the checkbox on but no secret entered must
+/// not claim a credential exists).
+fn store_secret(id: &str, kind: &str, save: bool, value: Option<&str>) -> Result<bool, String> {
+    if !save {
+        secrets::delete(id, kind);
+        return Ok(false);
+    }
+    match value {
+        Some(value) if !value.is_empty() => {
+            secrets::set(id, kind, value)?;
+            Ok(true)
+        }
+        _ => Ok(secrets::get(id, kind).is_some()),
+    }
 }
 #[tauri::command]
 fn delete_profile(state: State<AppState>, id: String) -> Result<(), String> {
@@ -120,6 +157,7 @@ fn save_app_settings(state: State<AppState>, settings: AppSettings) -> Result<Ap
 #[tauri::command]
 fn connect_session(
     app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
     state: State<AppState>,
     request: ConnectRequest,
 ) -> Result<SessionSummary, String> {
@@ -134,16 +172,15 @@ fn connect_session(
         .passphrase
         .or_else(|| secrets::get(&profile.id, "passphrase"));
     let settings = state.db.settings()?;
-    let summary = state.sessions.connect(
+    state.sessions.connect(
         app,
-        profile.clone(),
+        window.label().to_string(),
+        profile,
         password,
         passphrase,
         state.known_hosts.clone(),
         settings,
-    );
-    state.db.touch_profile(&profile.id);
-    Ok(summary)
+    )
 }
 
 fn validate_settings(settings: &AppSettings) -> Result<(), String> {
@@ -239,6 +276,7 @@ pub fn run() {
             save_app_settings,
             connect_session,
             terminal_transport_info,
+            window_positioning_reliable,
             disconnect_session,
             approve_host_key
         ])

@@ -13,7 +13,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::broadcast;
 use tokio::sync::{mpsc, oneshot};
 
@@ -23,17 +23,41 @@ enum Control {
     Disconnect,
 }
 
+type SessionMap = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<Control>>>>;
+type ApprovalMap = Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>;
+
+/// Removes a session's control channel and any pending host-key approval when
+/// the session task ends — naturally, by error, or by panic. Without this the
+/// maps only shrink on explicit disconnect and grow for the app's lifetime.
+struct SessionCleanup {
+    id: String,
+    sessions: SessionMap,
+    approvals: ApprovalMap,
+}
+impl Drop for SessionCleanup {
+    fn drop(&mut self) {
+        if let Ok(mut sessions) = self.sessions.lock() {
+            sessions.remove(&self.id);
+        }
+        if let Ok(mut approvals) = self.approvals.lock() {
+            approvals.remove(&self.id);
+        }
+    }
+}
+
 pub struct SessionManager {
-    sessions: Mutex<HashMap<String, mpsc::UnboundedSender<Control>>>,
-    approvals: Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>,
+    sessions: SessionMap,
+    approvals: ApprovalMap,
     output: broadcast::Sender<SessionOutput>,
 }
 
 impl Default for SessionManager {
     fn default() -> Self {
-        let (output, _) = broadcast::channel(1024);
+        // Sized for output bursts (e.g. cat-ing a large file) so a briefly
+        // slow webview does not force the transport to drop frames.
+        let (output, _) = broadcast::channel(8192);
         Self {
-            sessions: Mutex::new(HashMap::new()),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
             approvals: Arc::new(Mutex::new(HashMap::new())),
             output,
         }
@@ -44,15 +68,19 @@ impl SessionManager {
     pub fn connect(
         &self,
         app: AppHandle,
+        origin_label: String,
         profile: MachineProfile,
         password: Option<String>,
         passphrase: Option<String>,
         known_hosts: PathBuf,
         settings: AppSettings,
-    ) -> SessionSummary {
+    ) -> Result<SessionSummary, String> {
         let id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = mpsc::unbounded_channel();
-        self.sessions.lock().unwrap().insert(id.clone(), tx);
+        self.sessions
+            .lock()
+            .map_err(|_| "Session lock failed")?
+            .insert(id.clone(), tx);
         let summary = SessionSummary {
             id: id.clone(),
             profile_id: profile.id.clone(),
@@ -65,10 +93,17 @@ impl SessionManager {
         let pid = profile.id.clone();
         let pname = profile.name.clone();
         let output = self.output.clone();
+        let cleanup = SessionCleanup {
+            id: id.clone(),
+            sessions: self.sessions.clone(),
+            approvals: self.approvals.clone(),
+        };
         tauri::async_runtime::spawn(async move {
+            let _cleanup = cleanup;
             if let Err(error) = run_session(
                 app.clone(),
                 sid.clone(),
+                origin_label,
                 profile,
                 password,
                 passphrase,
@@ -90,7 +125,7 @@ impl SessionManager {
                 );
             }
         });
-        summary
+        Ok(summary)
     }
     pub fn subscribe_output(&self) -> broadcast::Receiver<SessionOutput> {
         self.output.subscribe()
@@ -103,7 +138,10 @@ impl SessionManager {
     }
     pub fn disconnect(&self, id: &str) -> Result<(), String> {
         let result = self.send(id, Control::Disconnect);
-        self.sessions.lock().unwrap().remove(id);
+        self.sessions
+            .lock()
+            .map_err(|_| "Session lock failed")?
+            .remove(id);
         result
     }
     pub fn approve(&self, id: &str, approve: bool) -> Result<(), String> {
@@ -129,10 +167,11 @@ impl SessionManager {
 struct HostVerifier {
     app: AppHandle,
     session_id: String,
+    origin_label: String,
     host: String,
     port: u16,
     path: PathBuf,
-    approvals: Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>,
+    approvals: ApprovalMap,
 }
 impl client::Handler for HostVerifier {
     type Error = russh::Error;
@@ -140,6 +179,11 @@ impl client::Handler for HostVerifier {
         match keys::known_hosts::check_known_hosts_path(&self.host, self.port, key, &self.path) {
             Ok(true) => return Ok(true),
             Err(_) => {
+                // A mismatched key (or an unreadable known_hosts file) is
+                // rejected outright. This challenge is informational only: no
+                // approval is awaited and approve_host_key will not find a
+                // pending request. The user must fix known_hosts by hand
+                // before reconnecting.
                 let challenge = HostKeyChallenge {
                     session_id: self.session_id.clone(),
                     host: self.host.clone(),
@@ -147,6 +191,7 @@ impl client::Handler for HostVerifier {
                     algorithm: key.algorithm().to_string(),
                     fingerprint: key.fingerprint(ssh_key::HashAlg::Sha256).to_string(),
                     kind: "changed".into(),
+                    window_label: self.origin_label.clone(),
                 };
                 let _ = self.app.emit("host-key-challenge", challenge);
                 return Ok(false);
@@ -166,6 +211,7 @@ impl client::Handler for HostVerifier {
             algorithm: key.algorithm().to_string(),
             fingerprint: key.fingerprint(ssh_key::HashAlg::Sha256).to_string(),
             kind: "new".into(),
+            window_label: self.origin_label.clone(),
         };
         let _ = self.app.emit("host-key-challenge", challenge);
         let accepted = tokio::time::timeout(Duration::from_secs(120), rx)
@@ -173,6 +219,11 @@ impl client::Handler for HostVerifier {
             .ok()
             .and_then(Result::ok)
             .unwrap_or(false);
+        // On timeout the sender is still in the map; drop it so stale
+        // approvals do not accumulate. Idempotent when approve() already ran.
+        if let Ok(mut pending) = self.approvals.lock() {
+            pending.remove(&self.session_id);
+        }
         if accepted {
             Ok(
                 keys::known_hosts::learn_known_hosts_path(&self.host, self.port, key, &self.path)
@@ -187,11 +238,12 @@ impl client::Handler for HostVerifier {
 async fn run_session(
     app: AppHandle,
     id: String,
+    origin_label: String,
     profile: MachineProfile,
     password: Option<String>,
     passphrase: Option<String>,
     known_hosts: PathBuf,
-    approvals: Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>,
+    approvals: ApprovalMap,
     output: broadcast::Sender<SessionOutput>,
     settings: AppSettings,
     mut controls: mpsc::UnboundedReceiver<Control>,
@@ -208,6 +260,7 @@ async fn run_session(
     let verifier = HostVerifier {
         app: app.clone(),
         session_id: id.clone(),
+        origin_label,
         host: profile.host.clone(),
         port: profile.port,
         path: known_hosts,
@@ -273,6 +326,11 @@ async fn run_session(
         SessionStatus::Connected,
         None,
     );
+    // Record last_connected_at only once the session actually reached
+    // Connected; failed attempts must not reorder the dashboard.
+    if let Some(state) = app.try_state::<crate::AppState>() {
+        state.db.touch_profile(&profile.id);
+    }
     loop {
         tokio::select! {
             control=controls.recv()=>match control {Some(Control::Input(data))=>{trace_latency("ssh-send",data.len());channel.data(&data[..]).await.map_err(|e|format!("write:{e}"))?;trace_latency("ssh-sent",data.len());},Some(Control::Resize(cols,rows))=>channel.window_change(cols,rows,0,0).await.map_err(|e|format!("resize:{e}"))?,Some(Control::Disconnect)|None=>{let _=channel.eof().await;let _=connection.disconnect(Disconnect::ByApplication,"Closed by user","en").await;break}},
@@ -330,6 +388,48 @@ fn user_error(error: &str) -> String {
         format!("Could not reach the server: {message}")
     } else {
         message.into()
+    }
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::{Control, SessionCleanup, SessionManager};
+    use std::sync::Arc;
+    use tokio::sync::{mpsc, oneshot};
+
+    #[test]
+    fn dropping_the_cleanup_guard_empties_both_maps() {
+        let manager = SessionManager::default();
+        let (control_tx, _control_rx) = mpsc::unbounded_channel::<Control>();
+        let (approval_tx, _approval_rx) = oneshot::channel::<bool>();
+        manager
+            .sessions
+            .lock()
+            .unwrap()
+            .insert("abc".into(), control_tx);
+        manager
+            .approvals
+            .lock()
+            .unwrap()
+            .insert("abc".into(), approval_tx);
+
+        drop(SessionCleanup {
+            id: "abc".into(),
+            sessions: Arc::clone(&manager.sessions),
+            approvals: Arc::clone(&manager.approvals),
+        });
+
+        assert!(manager.sessions.lock().unwrap().is_empty());
+        assert!(manager.approvals.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn disconnecting_an_already_cleaned_session_reports_not_found() {
+        let manager = SessionManager::default();
+        assert_eq!(
+            manager.disconnect("missing"),
+            Err("Session not found".to_string())
+        );
     }
 }
 

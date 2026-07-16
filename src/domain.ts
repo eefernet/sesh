@@ -53,7 +53,7 @@ export interface SessionSummary {
 }
 
 export interface HostKeyChallenge {
-  sessionId: string; host: string; port: number; algorithm: string; fingerprint: string; kind: "new" | "changed";
+  sessionId: string; host: string; port: number; algorithm: string; fingerprint: string; kind: "new" | "changed"; windowLabel: string;
 }
 
 export interface SessionOutput { sessionId: string; data: number[] }
@@ -103,4 +103,44 @@ export function validateMachine(draft: MachineDraft): Record<string, string> {
   if (!draft.username.trim() || /\s/.test(draft.username)) errors.username = "Enter an SSH username.";
   if (draft.authKind === "privateKey" && !draft.privateKeyPath?.trim()) errors.privateKeyPath = "Choose a private key.";
   return errors;
+}
+
+interface MachineExportEntry { name: string; host: string; port: number; username: string; authKind: AuthKind; privateKeyPath?: string; themeId?: string }
+export interface MachineExportFile { schemaVersion: 1; kind: "sesh-machines"; profiles: MachineExportEntry[] }
+
+/** Secrets and saved-credential flags never travel in exports. */
+export function serializeMachineExport(profiles: MachineProfile[]): string {
+  const file: MachineExportFile = {
+    schemaVersion: 1,
+    kind: "sesh-machines",
+    profiles: profiles.map(({ name, host, port, username, authKind, privateKeyPath, themeId }) => ({ name, host, port, username, authKind, privateKeyPath, themeId })),
+  };
+  return JSON.stringify(file, null, 2);
+}
+
+export function parseMachineImport(text: string): { drafts: MachineDraft[] } | { error: string } {
+  let parsed: unknown;
+  try { parsed = JSON.parse(text); } catch { return { error: "This file is not valid JSON." }; }
+  const file = parsed as Partial<MachineExportFile> | null;
+  if (!file || file.kind !== "sesh-machines" || file.schemaVersion !== 1 || !Array.isArray(file.profiles)) return { error: "This file is not a sesh machine export." };
+  const drafts: MachineDraft[] = [];
+  for (const entry of file.profiles) {
+    const draft: MachineDraft = {
+      name: String(entry?.name ?? ""),
+      host: String(entry?.host ?? ""),
+      port: Number(entry?.port ?? 22),
+      username: String(entry?.username ?? ""),
+      authKind: entry?.authKind === "privateKey" ? "privateKey" : "password",
+      privateKeyPath: typeof entry?.privateKeyPath === "string" ? entry.privateKeyPath : undefined,
+      themeId: typeof entry?.themeId === "string" ? entry.themeId : undefined,
+      savePassword: false,
+      savePassphrase: false,
+    };
+    const errors = validateMachine(draft);
+    const firstError = Object.values(errors)[0];
+    if (firstError) return { error: `Machine "${draft.name || "unnamed"}" is invalid: ${firstError}` };
+    drafts.push(draft);
+  }
+  if (!drafts.length) return { error: "The file contains no machines." };
+  return { drafts };
 }
